@@ -1,0 +1,771 @@
+---
+title: 'ADA on Employment: Data Preparation'
+author: "Young Ahn"
+date: "2025-04-15"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+SIPP 1990 Panel timing (Table 1, page 12 in raw/sipp1990fp.pdf)
+- Rotation 1: First interview May 1990, first reference month Jan 1990
+- Rotation 2: First interview Feb 1990, first reference month Oct 1989
+- Rotation 3: First interview Mar 1990, first reference month Nov 1989
+- Rotation 4: First interview Apr 1990, first reference month Dec 1989
+The panel runs for 32 months (8 waves x 4 months each)
+
+Three analysis configurations:
+
+1. **Monthly Analysis by Rotation** - All 32 months per rotation
+   - time_index_monthly: relative to rotation (1 = first month in rotation group)
+   - NOT calendar-based; each rotation starts at its own first reference month
+   - Treatment: July 1990 (ADA signing), which corresponds to:
+     - Rotation 1: time_index = 7 (first reference month = Jan 1990)
+     - Rotation 2: time_index = 10 (first reference month = Oct 1989)
+     - Rotation 3: time_index = 9 (first reference month = Nov 1989)
+     - Rotation 4: time_index = 8 (first reference month = Dec 1989)
+   - Each rotation analyzed separately with rotation-specific treatment timing
+
+2. **Wave-based Analysis by Rotation** - First month of each wave (8 waves)
+   - time_index_wave = interview_wave (1-8)
+   - Treatment period: Wave 3 (time_index_wave = 3)
+   - Each rotation analyzed separately
+
+3. **Combined Analysis (Jan/May/Sep)** - All 4 rotations combined
+   - time_index_combined: 1 = Jan 1990, 2 = May 1990, 3 = Sep 1990, ..., 8 = May 1992 (every 4 months)
+   - Treatment period: time_index = 3 (Sep 1990, first post-treatment)
+   - All rotation groups combined
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev = 'pdf', fig.width = 8, fig.height = 5)
+
+library(did)
+library(dplyr)
+library(haven)
+library(ak)
+library(ggpubr)
+library(RColorBrewer)
+library(tidyr)
+```
+
+```{r setup-parameters}
+extraction_dir <- "data/extracted/"
+zip_file_transition <- c("data/raw/sip90fp.zip", "data/raw/sip90t3.zip")
+data_final_dir <- "data/extracted/"
+data_final_dir_w1 <- file.path(data_final_dir, "sip90fp.dta")
+data_topical_dir <- file.path(data_final_dir, "sip90t3.dta")
+data_ada_path <- "data/generated/ada.RData"
+
+# State and outcome information data directories
+outcome_pairs_dir <- "data/empirical-specs/empirical_specs.csv"
+
+# Prefixes used for columns for Monthly data 
+monthly_data_columns_prefix <- c("esr_", "pp_ear", "age_")
+
+# Age range
+age_min <- 21
+age_max <- 58
+
+# Subsample counts (actual data contain more than 20,000 individuals)
+# Use Inf to include all individuals
+N_SUBSAMPLE <- Inf
+
+# Time index parameters
+# ADA was signed July 26, 1990
+#
+# Three analysis configurations:
+#
+# 1. Monthly Analysis: All 32 months per rotation
+#    time_index_monthly: relative to rotation (1 = first month)
+#    NOT calendar-based; each rotation starts at its own first reference month
+#    Treatment: July 1990 (ADA signing) - rotation-specific time indices:
+#      - Rotation 1: time_index = 7 (first reference month = Jan 1990)
+#      - Rotation 2: time_index = 10 (first reference month = Oct 1989)
+#      - Rotation 3: time_index = 9 (first reference month = Nov 1989)
+#      - Rotation 4: time_index = 8 (first reference month = Dec 1989)
+#
+# 2. Wave-based Analysis: First month of each wave (8 waves)
+#    time_index_wave = interview_wave (1-8)
+#    Treatment: wave 3
+#
+# 3. Combined Analysis (Jan/May/Sep): All rotations combined
+#    time_index_combined: 1 = Jan 1990, 2 = May 1990, 3 = Sep 1990, ..., 8 = May 1992
+#    Treatment: time_index = 3 (September 1990)
+#
+TIME_INDEX_TREATED_MONTHLY <- 7  # July 1990 (when ADA was signed) - for rotation 1 only
+# Rotation-specific treatment timing (July 1990 at correct index for each rotation)
+# Each rotation starts at a different calendar month, so July 1990 corresponds to:
+TIME_INDEX_TREATED_MONTHLY_ROT_1 <- 7   # Jan 1990 + 6 = July 1990
+TIME_INDEX_TREATED_MONTHLY_ROT_2 <- 10  # Oct 1989 + 9 = July 1990
+TIME_INDEX_TREATED_MONTHLY_ROT_3 <- 9   # Nov 1989 + 8 = July 1990
+TIME_INDEX_TREATED_MONTHLY_ROT_4 <- 8   # Dec 1989 + 7 = July 1990
+TIME_INDEX_TREATED_WAVE <- 3     # Wave 3
+TIME_INDEX_TREATED_COMBINED <- 3 # September 1990 (first post-treatment period)
+
+# Legacy variable for backward compatibility
+TIME_INDEX_TREATED <- TIME_INDEX_TREATED_COMBINED
+
+```
+
+```{r load-data}
+#' Unzip Files to a Directory
+#'
+#' This function unzips the files contained in the specified zip file and saves them in the specified extraction directory.
+#'
+#' @param zip_file_transition A character string representing the transition to the zip file. Defaults to "data/raw/jtpa_national_evaluation.zip".
+#' @param extraction_dir A character string representing the directory where the files should be extracted. Defaults to "data/extracted/jtpa_national_evaluation".
+#'
+#' @return This function does not return a value. It unzips the specified zip file into the specified extraction directory.
+#' @examples
+#' unzip_to_dir()
+#' unzip_to_dir("transition/to/your.zip", "transition/to/extraction_dir")
+unzip_to_dir <- function(zip_file_transition = "data/raw/jtpa_national_evaluation.zip",
+                         extraction_dir = "data/extracted/jtpa_national_evaluation") {
+
+  # Check if the extraction directory exists; if not, create it
+  if (!dir.exists(extraction_dir)) {
+    dir.create(extraction_dir)
+  }
+
+  # Unzip the files
+  sapply(zip_file_transition, function(x) unzip(zipfile = x, exdir = extraction_dir))
+}
+
+# Uncomment the following lines if ran for the first time
+unzip_to_dir(zip_file_transition = zip_file_transition, extraction_dir = extraction_dir)
+```
+
+
+Data cleaning:
+
+```{r}
+# Load the state codes
+# state_codes <- read.csv(tst_intv_codebook_dir)
+# aca_status_df <- read.csv(aca_status_dir)
+empirical_specs_df <- read.csv(outcome_pairs_dir, row.names = NULL) %>%
+  filter(included_in_analysis == 1)
+
+# Generate a `treated` variable based on ACA initial expansion status. (`state_to_treated`)
+# Could be NaN if out of state or foreign coutnries
+disab_to_treated <- function(df) {
+  df %>%
+    mutate(treated = ifelse(state %in% aca_status_df$state[aca_status_df$aca_introduced_jan2014 == 1], 1, 0)) %>%
+    mutate(treated = ifelse(state %in% aca_status_df$state[aca_status_df$aca_already_implmented_jan2014 == 1], NaN, treated)) %>%
+    mutate(treated = ifelse(state %in% aca_status_df$state, treated, NaN))
+}
+
+filter_by_age <- function(df_long, age_min = -Inf, age_max = Inf) {
+  # Remove units (id) whose ages are outside the specified range in any month
+  df_long %>%
+    group_by(id) %>%
+    # Check if ALL age values are within the bounds
+    filter(all(age >= age_min & age <= age_max)) %>%
+    ungroup()
+}
+
+add_employed <- function(df) {
+  df %>% 
+    mutate(employed = ifelse(esr > 0 & esr < 6, 1, 0)) %>%
+    mutate(unemployed = ifelse(esr >= 6 & esr <= 7, 1, 0)) %>%
+    mutate(olf = !(employed | unemployed)) %>%
+    mutate(labor_force_status = ifelse(employed == 1, "employed",
+                                        ifelse(unemployed == 1, "unemployed", "olf")))
+}
+
+filter_complete_data <- function(df_merged) {
+  # Determine the full range of month_index
+  full_time_index <- seq(min(df_merged$time_index), max(df_merged$time_index))
+  
+  # Group by id and check for complete month_index
+  df_complete_check <- df_merged %>%
+    group_by(id) %>%
+    summarize(has_complete_monthly_data = all(full_time_index %in% time_index),
+              has_complete_esr_data = !any(esr == 0)) %>%
+    ungroup() %>%
+    mutate(has_complete_monthly_data = ifelse(is.na(has_complete_monthly_data), FALSE, has_complete_monthly_data)) %>%
+    mutate(has_complete_data = has_complete_monthly_data & has_complete_esr_data) 
+  
+  # Merge the result back to df and filter based on has_complete_data
+  event_study_df <- df_merged %>%
+    left_join(df_complete_check, by = "id") %>%
+    filter(has_complete_data == TRUE)
+  
+  return(event_study_df)
+}
+
+wide_to_long_df_sipp1990 <- function(wide_df, monthly_data_columns_prefix) {
+  # Build a regex pattern to match the prefixes
+  prefix_pattern <- paste0("^(", paste(monthly_data_columns_prefix, collapse = "|"), ")\\d+")
+
+  # SIPP 1990 Panel timing (Table 1, page 12 in raw/sipp1990fp.pdf)
+  # - Rotation 1: First interview May 1990, first reference month Jan 1990
+  # - Rotation 2: First interview Feb 1990, first reference month Oct 1989
+  # - Rotation 3: First interview Mar 1990, first reference month Nov 1989
+  # - Rotation 4: First interview Apr 1990, first reference month Dec 1989
+  # The panel runs for 32 months (8 waves x 4 months each)
+
+  # Reshape the data from wide to long format
+  long_df <- wide_df %>%
+    select(suseqnum, rot, disab, disab_nwr, disab_any, white, male, state,
+           # Monthly analysis treatment cohorts
+           treatment_cohort_monthly_disab, treatment_cohort_monthly_disab_any,
+           # Rotation-specific monthly treatment cohorts (July 1990 at correct index for each rotation)
+           treatment_cohort_monthly_rot_1_disab, treatment_cohort_monthly_rot_2_disab,
+           treatment_cohort_monthly_rot_3_disab, treatment_cohort_monthly_rot_4_disab,
+           # Wave-based analysis treatment cohorts
+           treatment_cohort_wave_disab, treatment_cohort_wave_disab_any,
+           # Combined analysis treatment cohorts
+           treatment_cohort_combined_disab, treatment_cohort_combined_disab_any,
+           # Legacy treatment cohorts
+           treatment_cohort_disab, treatment_cohort_disab_any,
+           higrade1, higrade2, higrade3, higrade4,
+           higrade5, higrade6, higrade7, higrade8,
+           matches(prefix_pattern)) %>%
+    tidyr::pivot_longer(
+      cols = matches(prefix_pattern),
+      names_to = c(".value", "interview_month"),
+      names_pattern = paste0("(", paste(monthly_data_columns_prefix, collapse = "|"), ")(\\d+)")
+    ) %>%
+    rename_with(~ stringr::str_remove(., "_$"))  %>%
+    mutate(interview_month = as.integer(interview_month)) %>%
+    rename(id = suseqnum) %>%
+    mutate(
+        rot_offset = case_when(
+          rot == 1 ~ 0L,
+          rot == 2 ~ -3L,
+          rot == 3 ~ -2L,
+          rot == 4 ~ -1L
+        ),
+        # time_index: 1 = Jan 1990, 2 = Feb 1990, ...,
+        # 0 = Dec 1989, -1 = Nov 1989, -2 = Oct 1989
+        time_index = interview_month + rot_offset,
+        # Convert to calendar year and month
+        calendar_year = 1990L + (time_index - 1L) %/% 12L,
+        calendar_month = ((time_index - 1L) %% 12L) + 1L
+      ) %>%
+    # Compute interview wave (1-8, each wave covers 4 months)
+    mutate(interview_wave = (interview_month - 1L) %/% 4L + 1L) %>%
+    mutate(treated = (disab == 1),
+           treatment_cohort = treated * TIME_INDEX_TREATED,
+           treatment_cohort_nwr = disab_nwr * TIME_INDEX_TREATED) %>%
+    mutate(sample_calendar_month = (time_index > 0) & (time_index <= max(interview_month) - 3))
+
+  long_df
+}
+
+# Adjust panel df to event study df
+panel_df_to_event_study_df <- function(df_merged, id_col = "id", index_col = "time_index", 
+                                       treated_col = "treated") {
+  df_merged %>%
+    rename(id = !!sym(id_col), time_index = !!sym(index_col), treated = !!sym(treated_col)) %>%
+    mutate(
+      treatment_cohort = treated * TIME_INDEX_TREATED
+    )
+}
+
+subsample <- function(df, N, idname = "id") {
+  # Subsample the same population for reproducibility
+  set.seed(1234)
+  
+  # Get unique IDs from the dataframe
+  unique_ids <- unique(df[[idname]])
+  
+  # Check if N is greater than the number of unique IDs
+  if (N > length(unique_ids)) {
+    warning("N is larger than the number of unique IDs in the dataframe.")
+  }
+  
+  # Randomly sample N IDs
+  sampled_ids <- sample(unique_ids, min(length(unique_ids), N))
+  
+  # Subset the dataframe to include only the rows with the sampled IDs
+  df_subsample <- df %>% filter(.data[[idname]] %in% sampled_ids)
+  
+  return(df_subsample)
+}
+
+expand_column <- function(df, column_name = "rot", idname = "id",
+                          fill_value = TRUE) {
+  expanded <- df %>%
+    select(!!sym(idname), !!sym(column_name)) %>%
+    group_by(!!sym(idname)) %>%
+    summarize(!!column_name := first(!!sym(column_name))) %>%
+    mutate(row_id = row_number(), value = fill_value) %>%
+    pivot_wider(
+        names_from = !!sym(column_name),
+        values_from = value,
+        values_fill = FALSE,
+        names_prefix = paste0(column_name, "_")
+    ) %>%
+    select(-row_id) 
+  df %>% 
+    left_join(expanded, by = idname)
+}
+
+add_wave <- function(long_df, months_per_wave = 4) {
+  long_df %>%
+    # sample_wave indicates first month of each wave (for sampling purposes)
+    mutate(sample_wave = 1*((interview_month %% months_per_wave) == 1))
+    # Note: interview_wave is now computed in wide_to_long_df_sipp1990()
+}
+```
+
+```{r data-topical}
+df_topical_raw <- haven::read_dta(data_topical_dir)
+
+disab_cond_1_colnames <- c("tm8926", "tm8928")
+disab_cond_2_colnames <- c("tm8838", "tm8842", "tm8846", "tm8850", "tm8854", 
+                           "tm8858", "tm8862", "tm8866", "tm8870", "tm8871")
+disab_cond_3_colnames <- c("tm8802", "tm8804", "tm8810", "tm8814", "tm8818", 
+                           "tm8822", "tm8826", "tm8830", "tm8834")
+disab_cond_4_colnames <- c("tm8902", "tm8904", "tm8906", "tm8908", "tm8910")
+
+
+df_topical <- df_topical_raw %>%
+  mutate(disab_cond_1 = rowSums(across(all_of(disab_cond_1_colnames), ~ . == 1), na.rm = TRUE)) %>%
+  mutate(disab_cond_2 = rowSums(across(all_of(disab_cond_2_colnames), ~ . == 1), na.rm = TRUE)) %>%
+  mutate(disab_cond_3 = rowSums(across(all_of(disab_cond_3_colnames), ~ . == 1), na.rm = TRUE)) %>%
+  mutate(disab_cond_4 = rowSums(across(all_of(disab_cond_4_colnames), ~ . == 1), na.rm = TRUE)) %>%
+  mutate(disab_nwr_satisfied = (disab_cond_1 > 0) | (disab_cond_2 > 1) | (disab_cond_3 > 0) | (disab_cond_4 > 0)) %>%
+  rename(pp_id = id, pp_entry = entry, pp_pnum = pnum) %>%
+  select(pp_id, pp_entry, pp_pnum, disab_nwr_satisfied, disab_cond_1, disab_cond_2, disab_cond_3, disab_cond_4)
+
+```
+
+```{r data-loading}
+df_raw <- haven::read_dta(data_final_dir_w1) 
+
+# some units do not appear due to death or not being born yet
+df_raw_merged_with_topical <- df_raw %>%
+  mutate(pp_id = as.integer(pp_id)) %>%
+  left_join(df_topical, by = c("pp_id", "pp_entry", "pp_pnum")) %>%
+  mutate(disab_nwr = ifelse(is.na(disab_nwr_satisfied), 0, (1-disab) * disab_nwr_satisfied)) %>%
+  mutate(disab_any = disab_nwr | disab,
+         # Treatment cohort columns for different analysis types
+         # Monthly: treatment at July 1990 (time_index_monthly = 7 for rotation 1)
+         # Legacy variable - uses rotation 1 timing for all rotations (incorrect for rotations 2-4)
+         treatment_cohort_monthly_disab = disab * TIME_INDEX_TREATED_MONTHLY,
+         treatment_cohort_monthly_disab_any = disab_any * TIME_INDEX_TREATED_MONTHLY,
+         # Rotation-specific monthly treatment cohorts (July 1990 at correct index for each rotation)
+         treatment_cohort_monthly_rot_1_disab = if_else(rot == 1, as.integer(disab * TIME_INDEX_TREATED_MONTHLY_ROT_1), 0L),
+         treatment_cohort_monthly_rot_2_disab = if_else(rot == 2, as.integer(disab * TIME_INDEX_TREATED_MONTHLY_ROT_2), 0L),
+         treatment_cohort_monthly_rot_3_disab = if_else(rot == 3, as.integer(disab * TIME_INDEX_TREATED_MONTHLY_ROT_3), 0L),
+         treatment_cohort_monthly_rot_4_disab = if_else(rot == 4, as.integer(disab * TIME_INDEX_TREATED_MONTHLY_ROT_4), 0L),
+         # Wave-based: treatment at wave 3
+         treatment_cohort_wave_disab = disab * TIME_INDEX_TREATED_WAVE,
+         treatment_cohort_wave_disab_any = disab_any * TIME_INDEX_TREATED_WAVE,
+         # Combined (Jan/May/Sep): treatment at Sep 1990 (time_index_combined = 3)
+         treatment_cohort_combined_disab = disab * TIME_INDEX_TREATED_COMBINED,
+         treatment_cohort_combined_disab_any = disab_any * TIME_INDEX_TREATED_COMBINED,
+         # Legacy columns for backward compatibility
+         treatment_cohort_disab = treatment_cohort_combined_disab,
+         treatment_cohort_disab_any = treatment_cohort_combined_disab_any,
+         white = (race == 1),
+         male = (sex == 1),
+         state = geo_ste1)
+```
+
+```{r data-merging-and-cleaning}
+# Process all data - do NOT filter to specific rotations or months early
+# All three analysis types (Monthly, Wave, Combined) will be supported from this dataset
+event_study_df_all <- df_raw_merged_with_topical %>%
+  wide_to_long_df_sipp1990(monthly_data_columns_prefix) %>%
+  add_employed() %>%
+  filter_by_age(age_min = age_min, age_max = age_max) %>%
+  add_wave(months_per_wave = 4)
+
+# Add rotation indicator columns
+event_study_df_all <- event_study_df_all %>%
+  expand_column("rot", "id") %>%
+  drop_na() %>%
+  as.data.frame()
+
+# Subsample if needed (for testing)
+event_study_df_all <- event_study_df_all %>%
+  subsample(N_SUBSAMPLE)
+
+n_units_all <- length(unique(event_study_df_all$id))
+print(paste("Total # of units after initial processing:", n_units_all))
+
+# Create time index columns for each analysis type
+event_study_df_all <- event_study_df_all %>%
+  mutate(
+    # Monthly: relative to rotation (1 = first month in rotation, 32 = last month)
+    # Each rotation has indices 1-32; treatment at index 7 means 7th month in each rotation
+    time_index_monthly = interview_month,
+
+    # Wave-based: use interview_wave (1-8)
+    time_index_wave = interview_wave,
+
+    # Combined (Jan/May/Sep): remap to 1-8 for Jan/May/Sep months
+    time_index_combined = case_when(
+      calendar_year == 1990 & calendar_month == 1 ~ 1L,
+      calendar_year == 1990 & calendar_month == 5 ~ 2L,
+      calendar_year == 1990 & calendar_month == 9 ~ 3L,
+      calendar_year == 1991 & calendar_month == 1 ~ 4L,
+      calendar_year == 1991 & calendar_month == 5 ~ 5L,
+      calendar_year == 1991 & calendar_month == 9 ~ 6L,
+      calendar_year == 1992 & calendar_month == 1 ~ 7L,
+      calendar_year == 1992 & calendar_month == 5 ~ 8L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+# Create sample indicators for Monthly Analysis by Rotation
+# Monthly analysis uses ALL 32 months per rotation
+# Each rotation has time_index_monthly = 1 to 32 (rotation-relative)
+event_study_df_all <- event_study_df_all %>%
+  mutate(
+    # All rotations: time_index_monthly = 1-32
+    sample_monthly_rot_1 = rot_1,
+    sample_monthly_rot_2 = rot_2,
+    sample_monthly_rot_3 = rot_3,
+    sample_monthly_rot_4 = rot_4
+  )
+
+# Create sample indicators for Monthly Rotation 1 with different post-treatment periods
+# Treatment is at month 7 for Rotation 1 (July 1990)
+# Post-treatment periods: 12, 14, 20, 22 months (ending at months 19, 21, 27, 29)
+event_study_df_all <- event_study_df_all %>%
+  mutate(
+    sample_monthly_rot_1_post12 = rot_1 & (time_index_monthly <= 19),  # 12 months post-treatment
+    sample_monthly_rot_1_post14 = rot_1 & (time_index_monthly <= 21),  # 14 months post-treatment
+    sample_monthly_rot_1_post20 = rot_1 & (time_index_monthly <= 27),  # 20 months post-treatment
+    sample_monthly_rot_1_post22 = rot_1 & (time_index_monthly <= 29)   # 22 months post-treatment
+  )
+
+# Create sample indicators for Monthly Rotation 2 with different post-treatment periods
+# Treatment is at month 10 for Rotation 2 (July 1990)
+# Post-treatment periods: 12, 14, 20, 22 months (ending at months 22, 24, 30, 32)
+event_study_df_all <- event_study_df_all %>%
+  mutate(
+    sample_monthly_rot_2_post12 = rot_2 & (time_index_monthly <= 22),  # 12 months post-treatment
+    sample_monthly_rot_2_post14 = rot_2 & (time_index_monthly <= 24),  # 14 months post-treatment
+    sample_monthly_rot_2_post20 = rot_2 & (time_index_monthly <= 30),  # 20 months post-treatment
+    sample_monthly_rot_2_post22 = rot_2                                # 22 months post-treatment (all 32 months)
+  )
+
+# Create sample indicators for Wave-based Analysis by Rotation
+# Wave analysis uses first month of each wave (8 waves total)
+event_study_df_all <- event_study_df_all %>%
+  mutate(
+    # sample_wave = 1 for first month of each wave (already computed in add_wave())
+    sample_wave_rot_1 = rot_1 & (sample_wave == 1),
+    sample_wave_rot_2 = rot_2 & (sample_wave == 1),
+    sample_wave_rot_3 = rot_3 & (sample_wave == 1),
+    sample_wave_rot_4 = rot_4 & (sample_wave == 1)
+  )
+
+# Create sample indicators for Combined Analysis (all rotations, Jan/May/Sep)
+# Combined analysis uses Jan/May/Sep for ALL rotation groups
+event_study_df_all <- event_study_df_all %>%
+  mutate(
+    # Base sample: rows with valid time_index_combined (Jan/May/Sep months)
+    sample_combined_base = !is.na(time_index_combined),
+
+    # Different time period configurations (2 pre-treatment + varying post-treatment)
+    sample_combined_t4 = sample_combined_base & (time_index_combined <= 4),
+    sample_combined_t5 = sample_combined_base & (time_index_combined <= 5),
+    sample_combined_t6 = sample_combined_base & (time_index_combined <= 6),
+    sample_combined_t7 = sample_combined_base & (time_index_combined <= 7),
+    sample_combined_t8 = sample_combined_base  # All 8 periods
+  )
+
+# Now filter to units with complete panel for each analysis type
+# We need to identify which units have complete data for each configuration
+
+# For Combined analysis: find units with all required time periods
+create_complete_panel_indicator <- function(df, sample_col, time_col, max_time) {
+  # Get units with complete data for this configuration
+  complete_units <- df %>%
+    filter(!!sym(sample_col)) %>%
+    group_by(id) %>%
+    summarize(
+      n_periods = n_distinct(!!sym(time_col)),
+      has_complete = n_periods == max_time,
+      .groups = "drop"
+    ) %>%
+    filter(has_complete) %>%
+    pull(id)
+
+  return(complete_units)
+}
+
+# Identify units with complete panels for Combined analysis (t4 through t8)
+complete_units_combined_t4 <- create_complete_panel_indicator(event_study_df_all, "sample_combined_t4", "time_index_combined", 4)
+complete_units_combined_t5 <- create_complete_panel_indicator(event_study_df_all, "sample_combined_t5", "time_index_combined", 5)
+complete_units_combined_t6 <- create_complete_panel_indicator(event_study_df_all, "sample_combined_t6", "time_index_combined", 6)
+complete_units_combined_t7 <- create_complete_panel_indicator(event_study_df_all, "sample_combined_t7", "time_index_combined", 7)
+complete_units_combined_t8 <- create_complete_panel_indicator(event_study_df_all, "sample_combined_t8", "time_index_combined", 8)
+
+# Identify units with complete panels for Wave analysis (8 waves)
+complete_units_wave_rot_1 <- create_complete_panel_indicator(event_study_df_all, "sample_wave_rot_1", "time_index_wave", 8)
+complete_units_wave_rot_2 <- create_complete_panel_indicator(event_study_df_all, "sample_wave_rot_2", "time_index_wave", 8)
+complete_units_wave_rot_3 <- create_complete_panel_indicator(event_study_df_all, "sample_wave_rot_3", "time_index_wave", 8)
+complete_units_wave_rot_4 <- create_complete_panel_indicator(event_study_df_all, "sample_wave_rot_4", "time_index_wave", 8)
+
+# Identify units with complete panels for Monthly analysis (32 months)
+complete_units_monthly_rot_1 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_1", "time_index_monthly", 32)
+complete_units_monthly_rot_2 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_2", "time_index_monthly", 32)
+complete_units_monthly_rot_3 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_3", "time_index_monthly", 32)
+complete_units_monthly_rot_4 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_4", "time_index_monthly", 32)
+
+# Identify units with complete panels for Monthly Rot 1 variants (different post-treatment periods)
+complete_units_monthly_rot_1_post12 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_1_post12", "time_index_monthly", 19)
+complete_units_monthly_rot_1_post14 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_1_post14", "time_index_monthly", 21)
+complete_units_monthly_rot_1_post20 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_1_post20", "time_index_monthly", 27)
+complete_units_monthly_rot_1_post22 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_1_post22", "time_index_monthly", 29)
+
+# Identify units with complete panels for Monthly Rot 2 variants (different post-treatment periods)
+complete_units_monthly_rot_2_post12 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_2_post12", "time_index_monthly", 22)
+complete_units_monthly_rot_2_post14 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_2_post14", "time_index_monthly", 24)
+complete_units_monthly_rot_2_post20 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_2_post20", "time_index_monthly", 30)
+complete_units_monthly_rot_2_post22 <- create_complete_panel_indicator(event_study_df_all, "sample_monthly_rot_2_post22", "time_index_monthly", 32)
+
+# Update sample indicators to only include units with complete panels
+event_study_df <- event_study_df_all %>%
+  mutate(
+    # Combined analysis sample indicators (with complete panel requirement)
+    sample_combined_t4 = sample_combined_t4 & (id %in% complete_units_combined_t4),
+    sample_combined_t5 = sample_combined_t5 & (id %in% complete_units_combined_t5),
+    sample_combined_t6 = sample_combined_t6 & (id %in% complete_units_combined_t6),
+    sample_combined_t7 = sample_combined_t7 & (id %in% complete_units_combined_t7),
+    sample_combined_t8 = sample_combined_t8 & (id %in% complete_units_combined_t8),
+
+    # Wave analysis sample indicators (with complete panel requirement)
+    sample_wave_rot_1 = sample_wave_rot_1 & (id %in% complete_units_wave_rot_1),
+    sample_wave_rot_2 = sample_wave_rot_2 & (id %in% complete_units_wave_rot_2),
+    sample_wave_rot_3 = sample_wave_rot_3 & (id %in% complete_units_wave_rot_3),
+    sample_wave_rot_4 = sample_wave_rot_4 & (id %in% complete_units_wave_rot_4),
+
+    # Monthly analysis sample indicators (with complete panel requirement)
+    sample_monthly_rot_1 = sample_monthly_rot_1 & (id %in% complete_units_monthly_rot_1),
+    sample_monthly_rot_2 = sample_monthly_rot_2 & (id %in% complete_units_monthly_rot_2),
+    sample_monthly_rot_3 = sample_monthly_rot_3 & (id %in% complete_units_monthly_rot_3),
+    sample_monthly_rot_4 = sample_monthly_rot_4 & (id %in% complete_units_monthly_rot_4),
+
+    # Monthly Rot 1 variants with different post-treatment periods (with complete panel requirement)
+    sample_monthly_rot_1_post12 = sample_monthly_rot_1_post12 & (id %in% complete_units_monthly_rot_1_post12),
+    sample_monthly_rot_1_post14 = sample_monthly_rot_1_post14 & (id %in% complete_units_monthly_rot_1_post14),
+    sample_monthly_rot_1_post20 = sample_monthly_rot_1_post20 & (id %in% complete_units_monthly_rot_1_post20),
+    sample_monthly_rot_1_post22 = sample_monthly_rot_1_post22 & (id %in% complete_units_monthly_rot_1_post22),
+
+    # Monthly Rot 2 variants with different post-treatment periods (with complete panel requirement)
+    sample_monthly_rot_2_post12 = sample_monthly_rot_2_post12 & (id %in% complete_units_monthly_rot_2_post12),
+    sample_monthly_rot_2_post14 = sample_monthly_rot_2_post14 & (id %in% complete_units_monthly_rot_2_post14),
+    sample_monthly_rot_2_post20 = sample_monthly_rot_2_post20 & (id %in% complete_units_monthly_rot_2_post20),
+    sample_monthly_rot_2_post22 = sample_monthly_rot_2_post22 & (id %in% complete_units_monthly_rot_2_post22)
+  )
+
+# Print summary statistics
+cat("\n=== Sample Sizes for Each Analysis Configuration ===\n\n")
+
+cat("Monthly Analysis by Rotation (32 months, complete panels):\n")
+cat(sprintf("  Rot 1: %d units\n", length(complete_units_monthly_rot_1)))
+cat(sprintf("  Rot 2: %d units\n", length(complete_units_monthly_rot_2)))
+cat(sprintf("  Rot 3: %d units\n", length(complete_units_monthly_rot_3)))
+cat(sprintf("  Rot 4: %d units\n", length(complete_units_monthly_rot_4)))
+
+cat("\nMonthly Rotation 1 with Different Post-Treatment Periods:\n")
+cat(sprintf("  12mo post (19 periods): %d units\n", length(complete_units_monthly_rot_1_post12)))
+cat(sprintf("  14mo post (21 periods): %d units\n", length(complete_units_monthly_rot_1_post14)))
+cat(sprintf("  20mo post (27 periods): %d units\n", length(complete_units_monthly_rot_1_post20)))
+cat(sprintf("  22mo post (29 periods): %d units\n", length(complete_units_monthly_rot_1_post22)))
+
+cat("\nMonthly Rotation 2 with Different Post-Treatment Periods:\n")
+cat(sprintf("  12mo post (22 periods): %d units\n", length(complete_units_monthly_rot_2_post12)))
+cat(sprintf("  14mo post (24 periods): %d units\n", length(complete_units_monthly_rot_2_post14)))
+cat(sprintf("  20mo post (30 periods): %d units\n", length(complete_units_monthly_rot_2_post20)))
+cat(sprintf("  22mo post (32 periods): %d units\n", length(complete_units_monthly_rot_2_post22)))
+
+cat("\nWave-based Analysis by Rotation (8 waves, complete panels):\n")
+cat(sprintf("  Rot 1: %d units\n", length(complete_units_wave_rot_1)))
+cat(sprintf("  Rot 2: %d units\n", length(complete_units_wave_rot_2)))
+cat(sprintf("  Rot 3: %d units\n", length(complete_units_wave_rot_3)))
+cat(sprintf("  Rot 4: %d units\n", length(complete_units_wave_rot_4)))
+
+cat("\nCombined Analysis - All Rotations (Jan/May/Sep, complete panels):\n")
+cat(sprintf("  t4 (4 periods): %d units\n", length(complete_units_combined_t4)))
+cat(sprintf("  t5 (5 periods): %d units\n", length(complete_units_combined_t5)))
+cat(sprintf("  t6 (6 periods): %d units\n", length(complete_units_combined_t6)))
+cat(sprintf("  t7 (7 periods): %d units\n", length(complete_units_combined_t7)))
+cat(sprintf("  t8 (8 periods): %d units\n", length(complete_units_combined_t8)))
+```
+
+```{r data-summary}
+table(event_study_df$disab, event_study_df$disab_nwr)
+```
+
+Verify data structure for all three analysis types:
+```{r verify-data-structure}
+cat("\n=== Verifying Data Structure for All Analysis Types ===\n\n")
+
+# Helper function to verify complete panel for a sample
+verify_sample <- function(df, sample_col, time_col, expected_periods, sample_name) {
+  sample_data <- df %>% filter(!!sym(sample_col))
+
+  if (nrow(sample_data) == 0) {
+    cat(sprintf("WARNING: %s has no data\n", sample_name))
+    return(FALSE)
+  }
+
+  obs_per_unit <- sample_data %>%
+    group_by(id) %>%
+    summarize(n_obs = n_distinct(!!sym(time_col)), .groups = "drop")
+
+  if (!all(obs_per_unit$n_obs == expected_periods)) {
+    cat(sprintf("FAILED: %s - not all units have %d periods\n", sample_name, expected_periods))
+    return(FALSE)
+  }
+
+  n_units <- nrow(obs_per_unit)
+  cat(sprintf("PASSED: %s - %d units with %d periods each\n", sample_name, n_units, expected_periods))
+  return(TRUE)
+}
+
+# Verify Combined Analysis samples
+cat("Combined Analysis (Jan/May/Sep, all rotations):\n")
+verify_sample(event_study_df, "sample_combined_t4", "time_index_combined", 4, "  Combined t4")
+verify_sample(event_study_df, "sample_combined_t5", "time_index_combined", 5, "  Combined t5")
+verify_sample(event_study_df, "sample_combined_t6", "time_index_combined", 6, "  Combined t6")
+verify_sample(event_study_df, "sample_combined_t7", "time_index_combined", 7, "  Combined t7")
+verify_sample(event_study_df, "sample_combined_t8", "time_index_combined", 8, "  Combined t8")
+
+# Verify Wave Analysis samples
+cat("\nWave-based Analysis by Rotation:\n")
+verify_sample(event_study_df, "sample_wave_rot_1", "time_index_wave", 8, "  Wave Rot 1")
+verify_sample(event_study_df, "sample_wave_rot_2", "time_index_wave", 8, "  Wave Rot 2")
+verify_sample(event_study_df, "sample_wave_rot_3", "time_index_wave", 8, "  Wave Rot 3")
+verify_sample(event_study_df, "sample_wave_rot_4", "time_index_wave", 8, "  Wave Rot 4")
+
+# Verify Monthly Analysis samples
+cat("\nMonthly Analysis by Rotation:\n")
+verify_sample(event_study_df, "sample_monthly_rot_1", "time_index_monthly", 32, "  Monthly Rot 1")
+verify_sample(event_study_df, "sample_monthly_rot_2", "time_index_monthly", 32, "  Monthly Rot 2")
+verify_sample(event_study_df, "sample_monthly_rot_3", "time_index_monthly", 32, "  Monthly Rot 3")
+verify_sample(event_study_df, "sample_monthly_rot_4", "time_index_monthly", 32, "  Monthly Rot 4")
+
+# Verify time index columns have correct ranges
+cat("\n=== Time Index Verification ===\n\n")
+
+cat("time_index_monthly range by rotation:\n")
+for (rot in 1:4) {
+  rot_data <- event_study_df %>% filter(!!sym(paste0("rot_", rot)))
+  if (nrow(rot_data) > 0) {
+    cat(sprintf("  Rot %d: %d to %d\n", rot, min(rot_data$time_index_monthly), max(rot_data$time_index_monthly)))
+  }
+}
+
+cat("\ntime_index_wave range (all rotations): ")
+wave_data <- event_study_df %>% filter(sample_wave == 1)
+cat(sprintf("%d to %d\n", min(wave_data$time_index_wave), max(wave_data$time_index_wave)))
+
+cat("\ntime_index_combined range (Jan/May/Sep months): ")
+combined_data <- event_study_df %>% filter(!is.na(time_index_combined))
+cat(sprintf("%d to %d\n", min(combined_data$time_index_combined), max(combined_data$time_index_combined)))
+
+# Verify calendar month mapping for combined analysis
+cat("\nCalendar month mapping for Combined Analysis (time_index_combined):\n")
+calendar_map <- event_study_df %>%
+  filter(!is.na(time_index_combined)) %>%
+  select(time_index_combined, calendar_year, calendar_month) %>%
+  distinct() %>%
+  arrange(time_index_combined)
+print(head(calendar_map, 8))
+
+# Verify treatment cohort columns
+cat("\n=== Treatment Cohort Verification ===\n\n")
+cat("treatment_cohort_monthly_disab values: ")
+cat(paste(sort(unique(event_study_df$treatment_cohort_monthly_disab)), collapse = ", "), "\n")
+cat("treatment_cohort_wave_disab values: ")
+cat(paste(sort(unique(event_study_df$treatment_cohort_wave_disab)), collapse = ", "), "\n")
+cat("treatment_cohort_combined_disab values: ")
+cat(paste(sort(unique(event_study_df$treatment_cohort_combined_disab)), collapse = ", "), "\n")
+
+# Verify rotation groups in data
+cat("\n=== Rotation Group Verification ===\n\n")
+rot_check <- event_study_df %>%
+  select(rot) %>%
+  distinct()
+cat("Rotation groups in data:", paste(sort(rot_check$rot), collapse = ", "), "\n")
+stopifnot(all(rot_check$rot %in% c(1, 2, 3, 4)))
+cat("Rotation group verification passed: All 4 rotation groups present\n")
+```
+
+Save data:
+```{r data-save}
+# Create directory if it does not exist
+if (!dir.exists(dirname(data_ada_path))) {
+  dir.create(dirname(data_ada_path), recursive = TRUE)
+}
+
+# Select only columns relevant to empirical analysis
+# Based on empirical_specs.csv requirements for all three analysis types
+event_study_df <- event_study_df %>%
+  select(
+    # Core columns
+    id, treated,
+
+    # Time index columns for different analysis types
+    time_index_monthly,    # Monthly analysis: relative to rotation (1 = first month, 7 = 7th month)
+    time_index_wave,       # Wave analysis: interview_wave (1-8)
+    time_index_combined,   # Combined analysis: Jan/May/Sep mapping (1-8)
+
+    # Treatment cohort columns for different analysis types
+    treatment_cohort_monthly_disab,    # Monthly: treatment at time_index = 7 (legacy, rotation 1 only)
+    treatment_cohort_monthly_rot_1_disab,  # Monthly Rot 1: treatment at time_index = 7 (July 1990)
+    treatment_cohort_monthly_rot_2_disab,  # Monthly Rot 2: treatment at time_index = 10 (July 1990)
+    treatment_cohort_monthly_rot_3_disab,  # Monthly Rot 3: treatment at time_index = 9 (July 1990)
+    treatment_cohort_monthly_rot_4_disab,  # Monthly Rot 4: treatment at time_index = 8 (July 1990)
+    treatment_cohort_wave_disab,       # Wave: treatment at wave 3
+    treatment_cohort_combined_disab,   # Combined: treatment at time_index = 3
+
+    # Outcome variable
+    labor_force_status,
+
+    # Cluster variable
+    state,
+
+    # Sample indicators - Monthly by rotation (all 32 months)
+    sample_monthly_rot_1, sample_monthly_rot_2, sample_monthly_rot_3, sample_monthly_rot_4,
+
+    # Sample indicators - Monthly Rot 1 with different post-treatment periods
+    sample_monthly_rot_1_post12, sample_monthly_rot_1_post14,
+    sample_monthly_rot_1_post20, sample_monthly_rot_1_post22,
+
+    # Sample indicators - Monthly Rot 2 with different post-treatment periods
+    sample_monthly_rot_2_post12, sample_monthly_rot_2_post14,
+    sample_monthly_rot_2_post20, sample_monthly_rot_2_post22,
+
+    # Sample indicators - Wave by rotation (8 waves, first month of each wave)
+    sample_wave_rot_1, sample_wave_rot_2, sample_wave_rot_3, sample_wave_rot_4,
+
+    # Sample indicators - Combined (all rotations, Jan/May/Sep)
+    sample_combined_t4, sample_combined_t5, sample_combined_t6, sample_combined_t7, sample_combined_t8,
+
+    # Rotation indicators
+    rot_1, rot_2, rot_3, rot_4,
+    rot,
+
+    # Auxiliary columns for debugging/verification
+    calendar_year, calendar_month, interview_wave, sample_wave
+  ) %>%
+  # Convert id to numeric and state to numeric (required by did::att_gt)
+  # state is haven_labelled from Stata import, needs conversion
+  mutate(id = as.numeric(id),
+         state = as.numeric(state)) %>%
+  # Add legacy treatment_cohort column (required by apply_sample_restriction)
+  # This will be overwritten by the cohort_varname specified in empirical_spec
+  mutate(treatment_cohort = treatment_cohort_combined_disab)
+
+print(paste("Columns in final dataset:", paste(colnames(event_study_df), collapse = ", ")))
+
+# Print final dataset dimensions
+cat(sprintf("\nFinal dataset: %d rows, %d columns\n", nrow(event_study_df), ncol(event_study_df)))
+
+# Save
+save(event_study_df, file = data_ada_path)
+cat(sprintf("\nDataset saved to: %s\n", data_ada_path))
+```

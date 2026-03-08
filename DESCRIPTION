@@ -1,0 +1,30 @@
+Package: ak
+Title: Event-Study Designs for Discrete Outcomes via Transition Independence
+Version: 0.1.0
+Authors@R:
+    person("Young", "Ahn", , "youngahn@upenn.edu", role = c("aut", "cre"))
+Description: Implements event-study designs for discrete outcomes using
+    transition independence and latent group structure. Estimates treatment
+    effects when outcomes are discrete and categorical, replacing the parallel
+    trends assumption with transition independence. Accommodates unobserved
+    heterogeneity via finite mixture models and a two-stage EM algorithm with
+    bootstrap inference.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Suggests:
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+Imports:
+    data.table,
+    did (>= 2.3.0),
+    dplyr,
+    fixest,
+    ggplot2,
+    ggpubr,
+    magrittr,
+    Matrix,
+    stats,
+    tibble,
+    tidyr

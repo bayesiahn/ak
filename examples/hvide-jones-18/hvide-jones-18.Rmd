@@ -1,0 +1,173 @@
+---
+title: 'Replicating Hvide and Jones (2018, American Economic Review)'
+author: "Young Ahn"
+date: "2024-10-23"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(did)
+library(dplyr)
+library(haven)
+library(ak)
+library(ggpubr)
+library(RColorBrewer)
+library(tidyr)
+```
+
+```{r setup-parameters}
+outcome_pairs_dir <- "data/empirical-specs/empirical_specs.csv"
+extraction_dir <- "data/extracted/"
+zip_file_transition <- "data/raw/113125-V1.zip"
+data_final_dir <- "data/extracted/Replication-Files-_-July_2018/data"
+data_final_dir_table_9 <- file.path(data_final_dir, "individual_patents_t9.dta")
+start_year <- 1995 # maximum is 1995
+end_year <- 2010 # minimum is 2010
+treated_year <- 2003
+T_PRETREATMENT <- treated_year - start_year
+T_POSTTREATMENT <- end_year - treated_year
+T_BY_UNIT <- T_PRETREATMENT + T_POSTTREATMENT + 1
+y_lab_function_transition <- function(y_name_from, y_name_to) {
+  y_name_from <- ifelse(y_name_from == 1, "Patenting", "No Patenting")
+  y_name_to <- ifelse(y_name_to == 1, "Patenting", "No patenting")
+
+  sprintf("%s Rates, Conditioning on %s Last Year", y_name_to, y_name_from)
+}
+# Estimation options
+opts = list(se_method = "boot", bootstrap_counts = 500,
+            multistart_mc_core_counts_short_run = 10,
+            multistart_mc_core_counts_long_run = 4,
+            bootstrap_mc_core_counts = 8)
+```
+
+```{r load-data}
+#' Unzip Files to a Directory
+#'
+#' This function unzips the files contained in the specified zip file and saves them in the specified extraction directory.
+#'
+#' @param zip_file_transition A character string representing the transition to the zip file. Defaults to "data/raw/jtpa_national_evaluation.zip".
+#' @param extraction_dir A character string representing the directory where the files should be extracted. Defaults to "data/extracted/jtpa_national_evaluation".
+#'
+#' @return This function does not return a value. It unzips the specified zip file into the specified extraction directory.
+#' @examples
+#' unzip_to_dir()
+#' unzip_to_dir("transition/to/your.zip", "transition/to/extraction_dir")
+unzip_to_dir <- function(zip_file_transition = "data/raw/jtpa_national_evaluation.zip",
+                         extraction_dir = "data/extracted/jtpa_national_evaluation") {
+
+  # Check if the extraction directory exists; if not, create it
+  if (!dir.exists(extraction_dir)) {
+    dir.create(extraction_dir)
+  }
+
+  # Unzip the files
+  unzip(zipfile = zip_file_transition, exdir = extraction_dir)
+}
+
+# Uncomment the following lines if ran for the first time
+unzip_to_dir(zip_file_transition = zip_file_transition, extraction_dir = extraction_dir)
+```
+
+
+Data cleaning:
+
+```{r}
+# Function to subset data based on the presence of all years within a range
+get_complete_panel <- function(data, id_col = "id_npo", year_col = "appyr", start_year = 2006, end_year = 2016) {
+
+  # get complete panel data
+  year_range <- seq(start_year, end_year)
+
+  data %>%
+    group_by(!!sym(id_col)) %>%
+    filter(all(year_range %in% !!sym(year_col))) %>%
+    ungroup()
+}
+
+# Adjust panel df to event study df
+panel_df_to_event_study_df <- function(data, id_col = "id_npo", year_col = "appyr",
+                                       treated_col = "treated",
+                                       start_year = 2006, end_year = 2016) {
+  df <- data %>%
+    mutate(id = !!sym(id_col), year = !!sym(year_col), treated = !!sym(treated_col))
+
+  df %>%
+    mutate(
+      time_index = year - start_year + 1,
+      treatment_cohort = treated * (treated_year - start_year + 1)
+    ) %>%
+  group_by(id) %>%
+  arrange(time_index, .by_group = TRUE) %>% ungroup()
+}
+
+```
+
+
+
+
+## Generate complete data
+```{r}
+# Get complete panel data
+panel_df_table_9 <- haven::read_dta(data_final_dir_table_9) %>%
+  filter(include_pre == 1) %>%
+  get_complete_panel(start_year = start_year, end_year = end_year) %>%
+  panel_df_to_event_study_df(treated_col = "uni_pre00_02",
+    start_year = start_year, end_year = end_year)
+panel_df_table_9_stayer <- haven::read_dta(data_final_dir_table_9) %>%
+  filter(include_stay == 1) %>%
+  get_complete_panel(start_year = start_year, end_year = end_year) %>%
+  panel_df_to_event_study_df(treated_col = "stayer",
+    start_year = start_year, end_year = end_year)
+```
+
+
+
+# Estimate models
+```{r}
+# Fix event_study_df to be used in the estimation
+# TODO: Change this to the appropriate panel_df_table_8, panel_df_table_9, or panel_df_table_9_stayer
+event_study_df <- panel_df_table_9
+```
+
+# Analysis
+```{r load-empirical-specs}
+# Load empirical specifications
+empirical_specs <- read.csv(outcome_pairs_dir) %>%
+  filter(included_in_analysis == 1) %>%
+  empirical_specs_df_to_empirical_specs()
+```
+
+```{r run-analysis}
+empirical_analysis_results <- lapply(empirical_specs, perform_empirical_analysis,
+                                     event_study_df, opts = opts)
+model_pairs <- lapply(empirical_analysis_results, "[[", "transition_models")
+models <- unlist(model_pairs, recursive = FALSE)
+main_empirical_analysis_result <- empirical_analysis_results[[1]]
+```
+
+
+```{r plot-averages}
+plot_average_pairs <- lapply(models, plot_averages)
+
+plot_average_pairs
+```
+
+```{r plot-transitions-all-uniform-ci}
+plot_transition_pairs <- lapply(models, plot_transitions, uniform_ci = TRUE,
+                                pretreatment_only = TRUE,
+                                y_lab_function = y_lab_function_transition)
+
+plot_transition_pairs
+```
+
+
+```{r plot-atts}
+plot_atts <- lapply(empirical_analysis_results, plot_all_att_comparison)
+
+plot_atts
+```

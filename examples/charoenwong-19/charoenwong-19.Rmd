@@ -1,0 +1,210 @@
+---
+title: 'Replicating Charoenwong et al. (2019, American Economic Review)'
+author: "Young Ahn"
+date: "2024-08-04"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev = 'pdf', fig.width = 8, fig.height = 5)
+
+library(did)
+library(dplyr)
+library(haven)
+library(transin)
+library(ggpubr)
+library(RColorBrewer)
+library(tidyr)
+library(fst)
+```
+
+```{r setup-parameters}
+J_MAX <- 6
+
+OUTCOME_NAME <- "monthly_complaint_sign"
+OUTCOME_VARNAME <- "complaint.sign.firm"
+OUTCOME_VARNAME_IN_WORDS <- "Labor Force Status"
+empirical_specs_df <- data.frame(outcome_varname = c(OUTCOME_VARNAME),
+                               outcome_name = c(OUTCOME_NAME))
+
+outcome_pairs_dir <- "data/raw/empirical_specs.csv"
+extraction_dir <- "data/extracted/"
+zip_file_transition <- "data/raw/116210-V1.zip"
+data_final_dir <- "data/extracted/data/data_for_distribution/"
+start_year <- 2006 # maximum is 2006
+end_year <- 2016 # minimum is 2016
+treated_year <- 2013
+T_PRETREATMENT <- treated_year - start_year
+T_POSTTREATMENT <- end_year - treated_year
+T_BY_UNIT <- T_PRETREATMENT + T_POSTTREATMENT + 1
+y_lab_function_transition <- function(y_name_from, y_name_to) {
+  y_name_from <- ifelse(y_name_from == 1, "complaint", "no complaint")
+  y_name_to <- ifelse(y_name_to == 1, "Complaint", "No complaint")
+
+  sprintf("%s rate | %s last year", y_name_to, y_name_from)
+}
+
+# Estimation options
+# Note: Limit parallel workers to prevent memory exhaustion
+opts = list(se_method = "boot", bootstrap_counts = 500,
+            multistart_mc_core_counts_short_run = 10,
+            multistart_mc_core_counts_long_run = 4,
+            bootstrap_mc_core_counts = 8)
+
+PLOT_YLIM_TREATMENT_EFFECTS <- c(-0.1, 0.5)
+PLOT_YLIM_PROB_HIGH <- c(0, 1)
+PLOT_YLIM_PROB_LOW <- c(0, 0.3)
+PLOT_YLIM_PROB_DIFF <- c(-0.6, 0.4)
+PLOT_YLIM_AVERAGES <- c(0, 1)
+PLOT_YLIM_AVERAGES_DIFF <- c(-0.4, 0.4)
+PLOT_YLIM_AGGREGATE_ATT <- c(-0.0125, 0.0125)
+PLOT_YLIM_COUNTERFACTUALS <- c(-0.015, 0.015)
+```
+
+```{r load-data}
+#' Unzip Files to a Directory
+#'
+#' This function unzips the files contained in the specified zip file and saves them in the specified extraction directory.
+#'
+#' @param zip_file_transition A character string representing the transition to the zip file. Defaults to "data/raw/jtpa_national_evaluation.zip".
+#' @param extraction_dir A character string representing the directory where the files should be extracted. Defaults to "data/extracted/jtpa_national_evaluation".
+#'
+#' @return This function does not return a value. It unzips the specified zip file into the specified extraction directory.
+#' @examples
+#' unzip_to_dir()
+#' unzip_to_dir("transition/to/your.zip", "transition/to/extraction_dir")
+unzip_to_dir <- function(zip_file_transition = "data/raw/jtpa_national_evaluation.zip",
+                         extraction_dir = "data/extracted/jtpa_national_evaluation") {
+
+  # Check if the extraction directory exists; if not, create it
+  if (!dir.exists(extraction_dir)) {
+    dir.create(extraction_dir)
+  }
+
+  # Unzip the files
+  unzip(zipfile = zip_file_transition, exdir = extraction_dir)
+}
+
+# Uncomment the following lines if ran for the first time
+unzip_to_dir(zip_file_transition = zip_file_transition, extraction_dir = extraction_dir)
+
+# Load data
+for(item in list.files(paste(data_final_dir,sep=''),full.names = TRUE,pattern='fst')){
+   print(paste(item,'---',Sys.time()))
+   # Read in, automatically assigned name
+      #strips out the prefix
+    auto_name = strsplit(item,split='/') %>% sapply(dplyr::last) %>% gsub('\\.fst','',.)
+
+    fst::read_fst(item,as.data.table = TRUE) %>% assign(x=auto_name,value=,.,envir=.GlobalEnv)
+}
+```
+
+Data cleaning:
+
+```{r}
+# Function to subset data based on the presence of all years within a range
+get_complete_panel <- function(data, id_col = "crd", year_col = "year", start_year = 2006, end_year = 2016) {
+  # Identify crd values with all years from start_year to end_year
+  complete_id <- data[, if(all(start_year:end_year %in% get(year_col))) .SD, by = get(id_col)][,get(id_col)]
+
+  # Subset the data to include only the complete crd
+  complete_panel <- data[get(id_col) %in% complete_id]
+
+  return(complete_panel)
+}
+
+# Get complete panel data
+event_study_df <- get_complete_panel(firm_panel,
+  id_col = "firmcrd", year_col = "year", start_year = start_year, end_year = end_year)
+
+# Load data
+event_study_df = event_study_df %>%
+  rename(id = firmcrd) %>%
+  mutate(treated = treated1) %>%
+  mutate(year_index = year - start_year + 1) %>%
+  mutate(time_index = year_index) %>%
+  mutate(treatment_cohort = treated*(treated_year - start_year + 1)) %>%
+  mutate(complaint.sign.firm = sign(n_complaints)) %>% # sort by id
+  arrange(id, year)
+
+```
+
+# Analysis
+```{r load-empirical-specs}
+# Load empirical specifications
+empirical_specs <- read.csv(outcome_pairs_dir) %>%
+  filter(included_in_analysis == 1) %>%
+  empirical_specs_df_to_empirical_specs()
+```
+
+
+```{r run-analysis}
+empirical_analysis_results <- lapply(empirical_specs, perform_empirical_analysis, event_study_df, opts = opts)
+model_pairs <- lapply(empirical_analysis_results, "[[", "transition_models")
+models <- unlist(model_pairs, recursive = FALSE)
+main_empirical_analysis_result <- empirical_analysis_results[[1]]
+```
+
+```{r plot-transitions-all-uniform-ci}
+plot_transition_pairs <- lapply(models, plot_transitions, uniform_ci = TRUE,
+                                pretreatment_only = TRUE,
+                                y_lab_function = y_lab_function_transition)
+
+plot_transition_pairs
+```
+
+## Cross-model comparison
+```{r plot-counterfactuals}
+plot_counterfactuals <- lapply(empirical_analysis_results, plot_all_counterfactual_comparison)
+
+plot_counterfactuals
+```
+
+Simplified counterfactual comparison (Treated, DiD, Our Model):
+```{r plot-counterfactuals-simple}
+plot_counterfactuals_simple <- lapply(empirical_analysis_results, plot_counterfactual_comparison_simple)
+
+plot_counterfactuals_simple
+```
+
+Counterfactual complaint rates by method (DiD vs Our Model):
+```{r counterfactual-rates-table, results='asis'}
+# Extract models from the first empirical analysis result
+ear <- empirical_analysis_results[[1]]
+models_list <- ear$transition_models
+did_model <- ear$did_result
+
+# J=1 transition model
+J1_model <- models_list[[which(sapply(models_list, function(x) length(x$priors)) == 1)[1]]]
+
+y_g <- get_y_numeric_and_g_from_model(J1_model)
+y_numeric <- y_g$y_numeric
+g <- y_g$g
+treated_period <- J1_model$treated_period
+
+# Compute counterfactual series
+df_treated <- get_df_outcome_treated(y_numeric, g, "Treated")
+df_did <- get_df_counterfactual_did_model(did_model, y_numeric, g, "DiD")
+df_ours <- get_df_counterfactual_transition_model(
+  J1_model, y_numeric, g, display_J = FALSE,
+  type_name_counterfactual_ours = "Our Model")
+
+df_table <- rbind(df_treated, df_did, df_ours) %>%
+  filter(t >= treated_period - 1) %>%
+  tidyr::pivot_wider(names_from = type, values_from = y) %>%
+  mutate(Year = t + start_year - 1,
+         `Relative t` = t - treated_period + 1) %>%
+  select(Year, `Relative t`, Treated, DiD, `Our Model`)
+
+knitr::kable(df_table, digits = 6, caption = "Counterfactual complaint rates: DiD vs Our Model. The DiD counterfactual falls below zero in 2016, implying an out-of-bounds probability.")
+```
+
+```{r plot-atts}
+plot_atts <- lapply(empirical_analysis_results, plot_all_att_comparison)
+
+plot_atts
+```

@@ -1,0 +1,255 @@
+---
+title: 'ADA on Employment: Analysis'
+author: "Young Ahn"
+date: "2025-01-21"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+Analysis using SIPP 1990 Panel with three analysis configurations:
+
+1. **Monthly Analysis by Rotation** - All 32 months per rotation
+   - time_index_monthly: relative to rotation (1 = first month in rotation group)
+   - NOT calendar-based; each rotation starts at its own first reference month
+   - Treatment: July 1990 (ADA signing), which corresponds to:
+     - Rotation 1: time_index = 7 (first reference month = Jan 1990)
+     - Rotation 2: time_index = 10 (first reference month = Oct 1989)
+     - Rotation 3: time_index = 9 (first reference month = Nov 1989)
+     - Rotation 4: time_index = 8 (first reference month = Dec 1989)
+   - Each rotation analyzed separately with rotation-specific treatment timing
+
+2. **Wave-based Analysis by Rotation** - 8 waves (first month of each)
+   - time_index_wave = interview_wave (1-8)
+   - Treatment: Wave 3
+   - Each rotation analyzed separately
+
+3. **Combined Analysis (Jan/May/Sep)** - All 4 rotations combined
+   - time_index_combined: 1 = Jan 1990, 2 = May 1990, 3 = Sep 1990, ..., 8 = May 1992 (every 4 months)
+   - Treatment: Sep 1990 (first post-ADA period)
+   - 2 pretreatment + varying post-treatment periods (t4-t8)
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev = 'pdf', fig.width = 8, fig.height = 5)
+
+library(did)
+library(dplyr)
+library(haven)
+library(ak)
+library(ggpubr)
+library(RColorBrewer)
+library(tidyr)
+```
+
+```{r setup-parameters}
+# Data path
+data_ada_path <- "data/generated/ada.RData"
+
+# State and outcome information data directories
+outcome_pairs_dir <- "data/empirical-specs/empirical_specs.csv"
+
+# Estimation options
+opts = list(se_method = "boot", bootstrap_counts = 500,
+            multistart_mc_core_counts_short_run = 10,
+            multistart_mc_core_counts_long_run = 4,
+            bootstrap_mc_core_counts = 4)
+
+y_lab_function_transition <- function(y_name_from, y_name_to) {
+  y_name_to <- ifelse(y_name_to == "olf", "OLF",
+                        ifelse(y_name_to == "employed", "Employed", "Unemployed"))
+  y_name_from <- ifelse(y_name_from == "olf", "OLF",
+                        ifelse(y_name_from == "employed", "Employed", "Unemployed"))
+
+  sprintf("%s-to-%s Rates", y_name_from, y_name_to)
+}
+```
+
+# Load data
+```{r load-data}
+# Check if file exists first, and load
+if (!file.exists(data_ada_path)) {
+  stop(paste0("File does not exist: ", data_ada_path,
+              "; run ada-on-employment-data-prep.Rmd first."))
+}
+
+load(data_ada_path)
+
+cat("=== Data Summary ===\n")
+cat(paste("Number of total observations:", nrow(event_study_df), "\n"))
+cat(paste("Number of unique units:", length(unique(event_study_df$id)), "\n"))
+
+# Show sample sizes for each analysis type
+cat("\n=== Sample Sizes by Analysis Configuration ===\n")
+
+cat("\nCombined Analysis (all rotations, Jan/May/Sep):\n")
+for (t in 4:8) {
+  sample_col <- paste0("sample_combined_t", t)
+  n_units <- length(unique(event_study_df$id[event_study_df[[sample_col]] == TRUE]))
+  cat(sprintf("  t%d (%d periods): %d units\n", t, t, n_units))
+}
+
+cat("\nWave-based Analysis by Rotation (8 waves each):\n")
+for (r in 1:4) {
+  sample_col <- paste0("sample_wave_rot_", r)
+  n_units <- length(unique(event_study_df$id[event_study_df[[sample_col]] == TRUE]))
+  cat(sprintf("  Rotation %d: %d units\n", r, n_units))
+}
+
+cat("\nMonthly Analysis by Rotation (32 months each):\n")
+for (r in 1:4) {
+  sample_col <- paste0("sample_monthly_rot_", r)
+  n_units <- length(unique(event_study_df$id[event_study_df[[sample_col]] == TRUE]))
+  cat(sprintf("  Rotation %d: %d units\n", r, n_units))
+}
+
+# Show calendar month mapping for combined analysis
+cat("\n=== Calendar Period Mapping (Combined Analysis) ===\n")
+calendar_periods <- event_study_df %>%
+  filter(!is.na(time_index_combined)) %>%
+  select(time_index_combined, calendar_year, calendar_month) %>%
+  distinct() %>%
+  arrange(time_index_combined)
+
+for (i in 1:nrow(calendar_periods)) {
+  month_name <- month.abb[calendar_periods$calendar_month[i]]
+  pre_post <- ifelse(calendar_periods$time_index_combined[i] < 3, "(pretreatment)",
+                     ifelse(calendar_periods$time_index_combined[i] == 3,
+                            "(first post-treatment)", "(post-treatment)"))
+  cat(sprintf("  %d = %s %d %s\n",
+              calendar_periods$time_index_combined[i],
+              month_name,
+              calendar_periods$calendar_year[i],
+              pre_post))
+}
+```
+
+# Analysis
+```{r load-empirical-specs}
+# Load empirical specifications
+empirical_specs <- read.csv(outcome_pairs_dir, row.names = NULL) %>%
+  filter(included_in_analysis == 1) %>%
+  empirical_specs_df_to_empirical_specs()
+
+cat("Number of empirical specifications:", length(empirical_specs), "\n")
+for (i in seq_along(empirical_specs)) {
+  cat(paste0("  ", i, ". ", empirical_specs[[i]]$sample_name, "\n"))
+}
+```
+
+```{r run-analysis}
+empirical_analysis_results <- lapply(empirical_specs, perform_empirical_analysis,
+                                      event_study_df, opts = opts)
+model_pairs <- lapply(empirical_analysis_results, "[[", "transition_models")
+models <- unlist(model_pairs, recursive = FALSE)
+
+cat("\nAnalysis complete. Number of models:", length(models), "\n")
+```
+
+```{r plot-averages}
+plot_average_pairs <- lapply(models, plot_averages)
+
+plot_average_pairs
+```
+
+
+## Aggregated Transition Plots (3x3 Grid)
+
+Helper function to create aggregated 3x3 transition plot from individual plots:
+```{r helper-aggregate-transitions}
+#' Create aggregated 3x3 transition plot
+#' @param transition_plots List of individual transition plots from plot_transitions()
+#' @param y_names Vector of outcome names (e.g., c("employed", "unemployed", "olf"))
+#' @return A ggplot object with all 9 transitions arranged in a 3x3 grid
+create_aggregated_transition_plot <- function(transition_plots, y_names) {
+  # Create plotlist in row-major order (rows = y_to, cols = y_from)
+  plotlist <- unlist(
+    lapply(y_names, function(y_to) {
+      lapply(y_names, function(y_from) {
+        plot_name <- paste0("-from-", y_from, "-to-", y_to)
+        transition_plots[[plot_name]]
+      })
+    }),
+    recursive = FALSE
+  )
+
+  # Arrange in grid
+ ggpubr::ggarrange(
+    plotlist = plotlist,
+    ncol = length(y_names),
+    nrow = length(y_names),
+    common.legend = TRUE,
+    legend = "bottom"
+  )
+}
+```
+
+```{r plot-transitions-aggregated-uniform-ci-pretreatment, fig.width=12, fig.height=12}
+y_names <- c("employed", "unemployed", "olf")
+
+# Pretreatment only
+plot_transition_list_pre <- lapply(models, plot_transitions, uniform_ci = TRUE,
+                                    pretreatment_only = TRUE,
+                                    y_lab_function = y_lab_function_transition)
+
+for (i in seq_along(plot_transition_list_pre)) {
+  model_name <- names(plot_transition_list_pre)[i]
+  if (is.null(model_name)) model_name <- paste("Model", i)
+  cat("\n###", model_name, "(Pretreatment only, Uniform CI)\n")
+  p <- create_aggregated_transition_plot(plot_transition_list_pre[[i]], y_names)
+  print(p)
+}
+```
+
+All outcomes:
+```{r plot-trends-all-outcomes}
+for (model in models) {
+  model_copy <- model
+  model_copy$event_study_df <- model_copy$event_study_df %>%
+    mutate(labor_force_status = ifelse(labor_force_status == "olf", "OLF", labor_force_status)) %>%
+    mutate(labor_force_status = ifelse(labor_force_status == "employed", "Employed", labor_force_status)) %>%
+    mutate(labor_force_status = ifelse(labor_force_status == "unemployed", "Unemployed", labor_force_status))
+  model_copy$Y$names <- c("Employed", "Unemployed", "OLF")
+  print(plot_data_trends_all_outcome(model_copy))
+}
+```
+
+
+```{r plot-atts}
+plot_atts <- lapply(empirical_analysis_results, plot_all_att_comparison)
+
+plot_atts
+```
+
+Simplified ATT comparison (DiD vs Our Model):
+```{r plot-atts-simple}
+plot_atts_simple <- lapply(empirical_analysis_results, plot_att_comparison_simple)
+
+plot_atts_simple
+```
+
+
+# Decomposing ATT
+## Draw plots
+```{r decomposition-plots}
+# Get all outcome_varnames
+outcome_varnames <- sapply(models, `[[`, "outcome_varname")
+
+# Find the index of the first occurrence of each unique outcome_varname
+first_indices <- match(unique(outcome_varnames), outcome_varnames)
+
+# Extract one model per unique outcome_varname
+representative_models <- models[first_indices]
+
+# Label function for decomposition plot legend
+outcome_label_function <- function(x) {
+  ifelse(x == "olf", "OLF",
+         ifelse(x == "employed", "Employed",
+                ifelse(x == "unemployed", "Unemployed", x)))
+}
+
+# Generate decomposition plots for each model
+lapply(representative_models, generate_all_decomposition_plots,
+       outcome_label_function = outcome_label_function)
+```
